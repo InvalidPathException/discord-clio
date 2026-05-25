@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+import anthropic
 import numpy as np
 import ollama
 from sklearn.cluster import HDBSCAN
@@ -18,6 +21,8 @@ from sklearn.preprocessing import normalize
 DEFAULT_INPUT = Path("data/sample-data.json")
 DEFAULT_CACHE = Path("data/message_body_embeddings_qwen3.npz")
 DEFAULT_OUTPUT = Path("reports/message_body_hierarchy.md")
+DEFAULT_LABEL_MODEL = "claude-haiku-4.5"
+POE_BASE_URL = "https://api.poe.com"
 
 REACTION_WORDS = {
     "lol",
@@ -41,6 +46,21 @@ NO_WORDS = {"no", "nah", "nope", "not"}
 class BodyRecord:
     index: int
     body: str
+    user_name: str | None = None
+    user_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ClusterLabel:
+    name: str
+    summary: str
+    rationale: str
+
+
+@dataclass(frozen=True)
+class ClusterLabels:
+    top: dict[int, ClusterLabel]
+    subclusters: dict[tuple[int, int], ClusterLabel]
 
 
 def normalize_short_text(body: str) -> str:
@@ -91,7 +111,15 @@ def load_body_records(
         if bucket:
             buckets.setdefault(bucket, []).append(body)
         else:
-            records.append(BodyRecord(index=index, body=body))
+            author = message.get("author") or {}
+            records.append(
+                BodyRecord(
+                    index=index,
+                    body=body,
+                    user_name=author.get("name"),
+                    user_id=author.get("id"),
+                )
+            )
     return records, buckets
 
 
@@ -220,6 +248,202 @@ def describe_cluster(
     lines.append("")
 
 
+def load_env(path: Path = Path(".env")) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def anthropic_client() -> anthropic.Anthropic:
+    load_env()
+    return anthropic.Anthropic(
+        api_key=os.getenv("POE_API_KEY"),
+        base_url=POE_BASE_URL,
+    )
+
+
+def parse_label_input(data: dict[str, Any]) -> ClusterLabel:
+    return ClusterLabel(
+        name=str(data["name"]),
+        summary=str(data["summary"]),
+        rationale=str(data["rationale"]),
+    )
+
+
+def parse_label_set(data: dict[str, Any]) -> tuple[ClusterLabel, dict[int, ClusterLabel]]:
+    parent = parse_label_input(data["parent"])
+    subclusters: dict[int, ClusterLabel] = {}
+    for item in data.get("subclusters", []):
+        subclusters[int(item["id"])] = ClusterLabel(
+            name=str(item["name"]),
+            summary=str(item["summary"]),
+            rationale=str(item["rationale"]),
+        )
+    return parent, subclusters
+
+
+def label_cluster_set(
+    client: anthropic.Anthropic,
+    model: str,
+    parent_bodies: list[str],
+    subclusters: list[dict[str, Any]],
+) -> tuple[ClusterLabel, dict[int, ClusterLabel]]:
+    prompt = {
+        "task": "Label a Discord message cluster and its subclusters.",
+        "instructions": [
+            "Use only the message text below.",
+            "Do not infer or mention author identity.",
+            "Label the parent and every provided subcluster.",
+            "Keep names short and human-readable.",
+            "Make subcluster names more specific than the parent name.",
+        ],
+        "parent_messages": parent_bodies,
+        "subclusters": subclusters,
+    }
+    message = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        tools=[
+            {
+                "name": "cluster_labels",
+                "description": "Return concise labels for one parent cluster and its subclusters.",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "parent": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "name": {"type": "string"},
+                                "summary": {"type": "string"},
+                                "rationale": {"type": "string"},
+                            },
+                            "required": ["name", "summary", "rationale"],
+                        },
+                        "subclusters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "integer"},
+                                    "name": {"type": "string"},
+                                    "summary": {"type": "string"},
+                                    "rationale": {"type": "string"},
+                                },
+                                "required": ["id", "name", "summary", "rationale"],
+                            },
+                        },
+                    },
+                    "required": ["parent", "subclusters"],
+                },
+            }
+        ],
+        tool_choice={"type": "tool", "name": "cluster_labels"},
+        messages=[
+            {
+                "role": "user",
+                "content": json.dumps(prompt, ensure_ascii=False),
+            }
+        ],
+    )
+    tool_use: Any = message.content[0]
+    return parse_label_set(tool_use.input)
+
+
+def label_cluster(
+    client: anthropic.Anthropic,
+    model: str,
+    bodies: list[str],
+) -> ClusterLabel:
+    label, _ = label_cluster_set(client, model, bodies, [])
+    return label
+
+
+def build_cluster_labels(
+    records: list[BodyRecord],
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    samples: int,
+    min_subcluster_size: int,
+    min_samples: int,
+    max_subclusters: int,
+    model: str = DEFAULT_LABEL_MODEL,
+) -> ClusterLabels:
+    client = anthropic_client()
+    cluster_labels: dict[int, ClusterLabel] = {}
+    subcluster_labels: dict[tuple[int, int], ClusterLabel] = {}
+    cluster_ids = [label for label in sorted(set(labels)) if label != -1]
+    cluster_ids.sort(key=lambda label: int(np.sum(labels == label)), reverse=True)
+
+    for cluster_id in cluster_ids:
+        member_indices = np.where(labels == cluster_id)[0]
+        example_indices = representative_indices(vectors, member_indices, samples)
+        parent_bodies = [records[index].body for index in example_indices]
+        subcluster_payloads: list[dict[str, Any]] = []
+
+        if len(member_indices) >= min_subcluster_size * 3:
+            sub_vectors = vectors[member_indices]
+            sub_labels = fit_hdbscan(
+                sub_vectors,
+                min_cluster_size=min_subcluster_size,
+                min_samples=min_samples,
+            )
+            subcluster_ids = [label for label in sorted(set(sub_labels)) if label != -1]
+            subcluster_ids.sort(
+                key=lambda label: int(np.sum(sub_labels == label)), reverse=True
+            )
+
+            for subcluster_id in subcluster_ids[:max_subclusters]:
+                local_positions = np.where(sub_labels == subcluster_id)[0]
+                global_indices = member_indices[local_positions]
+                sub_examples = representative_indices(
+                    vectors,
+                    global_indices,
+                    min(samples, 8),
+                )
+                subcluster_payloads.append(
+                    {
+                        "id": int(subcluster_id),
+                        "messages": [records[index].body for index in sub_examples],
+                    }
+                )
+
+        parent_label, child_labels = label_cluster_set(
+            client,
+            model,
+            parent_bodies,
+            subcluster_payloads,
+        )
+        cluster_labels[int(cluster_id)] = parent_label
+        for subcluster_id, label in child_labels.items():
+            subcluster_labels[(int(cluster_id), subcluster_id)] = label
+        print(f"labeled cluster {cluster_id}", flush=True)
+
+    return ClusterLabels(top=cluster_labels, subclusters=subcluster_labels)
+
+
+def prominent_users(
+    records: list[BodyRecord],
+    member_indices: np.ndarray,
+    limit: int,
+) -> list[tuple[str, int]]:
+    counter: Counter[str] = Counter()
+    for index in member_indices:
+        record = records[int(index)]
+        user = record.user_name or record.user_id
+        if user:
+            counter[user] += 1
+    return counter.most_common(limit)
+
+
 def write_report(
     output: Path,
     records: list[BodyRecord],
@@ -231,6 +455,8 @@ def write_report(
     samples: int,
     max_subclusters: int,
     clustering_note: str,
+    cluster_labels: ClusterLabels | dict[int, ClusterLabel] | None = None,
+    user_limit: int = 8,
 ) -> None:
     lines = [
         "# Hierarchical Message Body Clusters",
@@ -268,12 +494,39 @@ def write_report(
 
     for cluster_id in cluster_ids:
         member_indices = np.where(top_labels == cluster_id)[0]
+        if isinstance(cluster_labels, ClusterLabels):
+            label = cluster_labels.top.get(int(cluster_id))
+        elif cluster_labels:
+            label = cluster_labels.get(int(cluster_id))
+        else:
+            label = None
+        if label:
+            lines.extend(
+                [
+                    f"### {label.name} ({len(member_indices)} bodies)",
+                    "",
+                    label.summary,
+                    "",
+                    f"Rationale: {label.rationale}",
+                    "",
+                ]
+            )
+        else:
+            lines.extend([f"### Cluster {cluster_id} ({len(member_indices)} bodies)", ""])
+
+        users = prominent_users(records, member_indices, user_limit)
+        if users:
+            lines.extend(["Prominent local users:", ""])
+            for user, count in users:
+                lines.append(f"- {json.dumps(user, ensure_ascii=False)}: {count}")
+            lines.append("")
+
         describe_cluster(
             lines,
             records,
             vectors,
             member_indices,
-            f"### Cluster {cluster_id} ({len(member_indices)} bodies)",
+            "Representative bodies:",
             samples,
         )
 
@@ -296,12 +549,32 @@ def write_report(
         for subcluster_id in subcluster_ids[:max_subclusters]:
             local_positions = np.where(sub_labels == subcluster_id)[0]
             global_indices = member_indices[local_positions]
+            sub_label = (
+                cluster_labels.subclusters.get((int(cluster_id), int(subcluster_id)))
+                if isinstance(cluster_labels, ClusterLabels)
+                else None
+            )
+            if sub_label:
+                heading = f"#### {sub_label.name} ({len(global_indices)} bodies)"
+                lines.extend(
+                    [
+                        heading,
+                        "",
+                        sub_label.summary,
+                        "",
+                        f"Rationale: {sub_label.rationale}",
+                        "",
+                    ]
+                )
+                heading = "Representative bodies:"
+            else:
+                heading = f"#### Cluster {cluster_id}.{subcluster_id} ({len(global_indices)} bodies)"
             describe_cluster(
                 lines,
                 records,
                 vectors,
                 global_indices,
-                f"#### Cluster {cluster_id}.{subcluster_id} ({len(global_indices)} bodies)",
+                heading,
                 min(samples, 8),
             )
 
