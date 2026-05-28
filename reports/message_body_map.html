@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Message Body Projection</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f3;
+      --ink: #202124;
+      --muted: #62665f;
+      --line: #d8d8cf;
+      --panel: #ffffff;
+      --accent: #1976d2;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      height: 100%;
+      overflow: hidden;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      height: 100dvh;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    aside {
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+      padding: 16px;
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    label {
+      display: block;
+      margin: 14px 0 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    input,
+    select,
+    button {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      font: inherit;
+      padding: 8px 10px;
+    }
+
+    button {
+      cursor: pointer;
+      background: var(--ink);
+      color: #fff;
+      border-color: var(--ink);
+      font-weight: 650;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .meta,
+    .selection {
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .selection strong {
+      display: block;
+      color: var(--ink);
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .body-text {
+      margin-top: 8px;
+      color: var(--ink);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .stage {
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100dvh;
+      background: #fbfbf8;
+    }
+
+    .tooltip {
+      position: absolute;
+      z-index: 2;
+      max-width: min(420px, calc(100vw - 32px));
+      pointer-events: none;
+      background: rgba(255, 255, 255, 0.96);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.14);
+      padding: 10px 12px;
+      transform: translate(12px, 12px);
+      display: none;
+    }
+
+    .legend {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+      max-height: 36dvh;
+      overflow-y: auto;
+      padding-right: 4px;
+      overscroll-behavior: contain;
+    }
+
+    .legend-item {
+      display: grid;
+      grid-template-columns: 14px 1fr auto;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      border: 1px solid rgba(0, 0, 0, 0.16);
+    }
+
+    .legend-name {
+      color: var(--ink);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    @media (max-width: 820px) {
+      main {
+        grid-template-columns: 1fr;
+        grid-template-rows: minmax(260px, 42dvh) minmax(0, 1fr);
+      }
+
+      aside {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        max-height: 42dvh;
+      }
+
+      canvas {
+        height: 58dvh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1>Message Body Projection</h1>
+      <button id="loadDefault">Load data/message_body_projection.json</button>
+
+      <label for="fileInput">Projection JSON</label>
+      <input id="fileInput" type="file" accept="application/json,.json">
+
+      <label for="clusterFilter">Cluster</label>
+      <select id="clusterFilter">
+        <option value="all">All clusters</option>
+      </select>
+
+      <label for="userFilter">User</label>
+      <select id="userFilter">
+        <option value="all">All users</option>
+      </select>
+
+      <label for="searchInput">Search</label>
+      <input id="searchInput" type="search" placeholder="message, label, or user">
+
+      <div class="row">
+        <button id="resetView">Reset View</button>
+        <button id="toggleNoise">Hide Noise</button>
+      </div>
+
+      <div id="meta" class="meta">Load a projection JSON file to begin.</div>
+      <div id="selection" class="selection"></div>
+      <div id="legend" class="legend"></div>
+    </aside>
+
+    <section class="stage">
+      <canvas id="map"></canvas>
+      <div id="tooltip" class="tooltip"></div>
+    </section>
+  </main>
+
+  <script>
+    const canvas = document.querySelector("#map");
+    const context = canvas.getContext("2d");
+    const tooltip = document.querySelector("#tooltip");
+    const meta = document.querySelector("#meta");
+    const legend = document.querySelector("#legend");
+    const selection = document.querySelector("#selection");
+    const clusterFilter = document.querySelector("#clusterFilter");
+    const userFilter = document.querySelector("#userFilter");
+    const searchInput = document.querySelector("#searchInput");
+    const loadDefault = document.querySelector("#loadDefault");
+    const fileInput = document.querySelector("#fileInput");
+    const resetView = document.querySelector("#resetView");
+    const toggleNoise = document.querySelector("#toggleNoise");
+
+    const palette = [
+      "#1976d2", "#c62828", "#2e7d32", "#ef6c00", "#6a1b9a", "#00838f",
+      "#ad1457", "#7b1fa2", "#558b2f", "#d84315", "#1565c0", "#5d4037",
+      "#00695c", "#9e9d24", "#4527a0", "#0277bd", "#b71c1c", "#33691e"
+    ];
+
+    let payload = null;
+    let points = [];
+    let bounds = null;
+    let view = {scale: 1, offsetX: 0, offsetY: 0};
+    let showNoise = true;
+    let hovered = null;
+    let selected = null;
+
+    function colorFor(cluster) {
+      if (cluster === -1) return "#9a9a93";
+      const index = Math.abs(Number(cluster)) % palette.length;
+      return palette[index];
+    }
+
+    function resizeCanvas() {
+      const ratio = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.floor(rect.width * ratio));
+      canvas.height = Math.max(1, Math.floor(rect.height * ratio));
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      draw();
+    }
+
+    function computeBounds(items) {
+      const xs = items.map(point => point.x);
+      const ys = items.map(point => point.y);
+      return {
+        minX: Math.min(...xs),
+        maxX: Math.max(...xs),
+        minY: Math.min(...ys),
+        maxY: Math.max(...ys)
+      };
+    }
+
+    function project(point) {
+      const rect = canvas.getBoundingClientRect();
+      const padding = 36;
+      const width = Math.max(bounds.maxX - bounds.minX, 1e-6);
+      const height = Math.max(bounds.maxY - bounds.minY, 1e-6);
+      const baseScale = Math.min((rect.width - padding * 2) / width, (rect.height - padding * 2) / height);
+      const x = padding + (point.x - bounds.minX) * baseScale;
+      const y = rect.height - padding - (point.y - bounds.minY) * baseScale;
+      return {
+        x: rect.width / 2 + (x - rect.width / 2) * view.scale + view.offsetX,
+        y: rect.height / 2 + (y - rect.height / 2) * view.scale + view.offsetY
+      };
+    }
+
+    function matchesFilters(point) {
+      if (!showNoise && point.cluster === -1) return false;
+      if (clusterFilter.value !== "all" && String(point.cluster) !== clusterFilter.value) return false;
+      if (userFilter.value !== "all" && (point.user_name || point.user_id || "") !== userFilter.value) return false;
+      const query = searchInput.value.trim().toLowerCase();
+      if (!query) return true;
+      return [
+        point.body,
+        point.cluster_name,
+        point.subcluster_name,
+        point.user_name,
+        point.user_id
+      ].some(value => String(value || "").toLowerCase().includes(query));
+    }
+
+    function filteredPoints() {
+      return points.filter(matchesFilters);
+    }
+
+    function draw() {
+      const rect = canvas.getBoundingClientRect();
+      context.clearRect(0, 0, rect.width, rect.height);
+      context.fillStyle = "#fbfbf8";
+      context.fillRect(0, 0, rect.width, rect.height);
+
+      if (!payload || !bounds) return;
+
+      const visible = filteredPoints();
+      for (const point of visible) {
+        const screen = project(point);
+        const isActive = point === hovered || point === selected;
+        context.beginPath();
+        context.arc(screen.x, screen.y, isActive ? 5 : 3, 0, Math.PI * 2);
+        context.fillStyle = colorFor(point.cluster);
+        context.globalAlpha = point.cluster === -1 ? 0.32 : 0.78;
+        context.fill();
+        if (isActive) {
+          context.globalAlpha = 1;
+          context.lineWidth = 2;
+          context.strokeStyle = "#202124";
+          context.stroke();
+        }
+      }
+      context.globalAlpha = 1;
+      meta.innerHTML = [
+        `<strong>${visible.length.toLocaleString()}</strong> of ${points.length.toLocaleString()} points shown`,
+        payload.metadata.projection,
+        payload.metadata.clustering_space
+      ].join("<br>");
+    }
+
+    function describe(point) {
+      if (!point) {
+        selection.innerHTML = "";
+        return;
+      }
+      const label = point.subcluster_name || point.cluster_name || `Cluster ${point.cluster}`;
+      const user = point.user_name || point.user_id || "unknown user";
+      selection.innerHTML = `
+        <strong>${escapeHtml(label)}</strong>
+        <div>Cluster ${point.cluster}${point.subcluster !== null && point.subcluster !== undefined ? `.${point.subcluster}` : ""}</div>
+        <div>${escapeHtml(user)}</div>
+        <div class="body-text">${escapeHtml(point.body)}</div>
+      `;
+    }
+
+    function updateTooltip(point, event) {
+      if (!point) {
+        tooltip.style.display = "none";
+        return;
+      }
+      const label = point.subcluster_name || point.cluster_name || `Cluster ${point.cluster}`;
+      tooltip.style.display = "block";
+      tooltip.style.left = `${event.clientX}px`;
+      tooltip.style.top = `${event.clientY}px`;
+      tooltip.innerHTML = `
+        <strong>${escapeHtml(label)}</strong>
+        <div>${escapeHtml(point.user_name || point.user_id || "unknown user")}</div>
+        <div class="body-text">${escapeHtml(point.body.slice(0, 360))}</div>
+      `;
+    }
+
+    function nearestPoint(event) {
+      if (!payload || !bounds) return null;
+      const rect = canvas.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      let best = null;
+      let bestDistance = 12;
+      for (const point of filteredPoints()) {
+        const screen = project(point);
+        const distance = Math.hypot(screen.x - x, screen.y - y);
+        if (distance < bestDistance) {
+          best = point;
+          bestDistance = distance;
+        }
+      }
+      return best;
+    }
+
+    function populateControls() {
+      const clusterRows = [...new Map(points.map(point => {
+        const name = point.cluster === -1 ? "Noise / Outliers" : point.cluster_name || `Cluster ${point.cluster}`;
+        return [point.cluster, {id: point.cluster, name}];
+      })).values()].sort((a, b) => a.id - b.id);
+
+      clusterFilter.innerHTML = `<option value="all">All clusters</option>` + clusterRows
+        .map(row => `<option value="${row.id}">${escapeHtml(row.name)} (${row.id})</option>`)
+        .join("");
+
+      const users = [...new Set(points.map(point => point.user_name || point.user_id).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b));
+      userFilter.innerHTML = `<option value="all">All users</option>` + users
+        .map(user => `<option value="${escapeAttr(user)}">${escapeHtml(user)}</option>`)
+        .join("");
+
+      const counts = new Map();
+      for (const point of points) counts.set(point.cluster, (counts.get(point.cluster) || 0) + 1);
+      legend.innerHTML = clusterRows
+        .filter(row => row.id !== -1)
+        .map(row => `
+          <div class="legend-item">
+            <span class="swatch" style="background:${colorFor(row.id)}"></span>
+            <span class="legend-name">${escapeHtml(row.name)}</span>
+            <span>${counts.get(row.id)}</span>
+          </div>
+        `).join("");
+    }
+
+    function loadProjection(data) {
+      payload = data;
+      points = data.points || [];
+      bounds = points.length ? computeBounds(points) : null;
+      view = {scale: 1, offsetX: 0, offsetY: 0};
+      hovered = null;
+      selected = null;
+      populateControls();
+      describe(null);
+      draw();
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, char => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#039;"
+      })[char]);
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replace(/`/g, "&#096;");
+    }
+
+    loadDefault.addEventListener("click", async () => {
+      const response = await fetch("../data/message_body_projection.json");
+      loadProjection(await response.json());
+    });
+
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      loadProjection(JSON.parse(await file.text()));
+    });
+
+    for (const control of [clusterFilter, userFilter, searchInput]) {
+      control.addEventListener("input", () => {
+        hovered = null;
+        selected = null;
+        describe(null);
+        updateTooltip(null);
+        draw();
+      });
+    }
+
+    toggleNoise.addEventListener("click", () => {
+      showNoise = !showNoise;
+      toggleNoise.textContent = showNoise ? "Hide Noise" : "Show Noise";
+      draw();
+    });
+
+    resetView.addEventListener("click", () => {
+      view = {scale: 1, offsetX: 0, offsetY: 0};
+      draw();
+    });
+
+    canvas.addEventListener("mousemove", event => {
+      hovered = nearestPoint(event);
+      updateTooltip(hovered, event);
+      draw();
+    });
+
+    canvas.addEventListener("mouseleave", () => {
+      hovered = null;
+      updateTooltip(null);
+      draw();
+    });
+
+    canvas.addEventListener("click", event => {
+      selected = nearestPoint(event);
+      describe(selected);
+      draw();
+    });
+
+    canvas.addEventListener("wheel", event => {
+      event.preventDefault();
+      const factor = event.deltaY < 0 ? 1.12 : 0.9;
+      view.scale = Math.min(12, Math.max(0.5, view.scale * factor));
+      draw();
+    }, {passive: false});
+
+    let dragStart = null;
+    canvas.addEventListener("pointerdown", event => {
+      dragStart = {x: event.clientX, y: event.clientY, offsetX: view.offsetX, offsetY: view.offsetY};
+      canvas.setPointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("pointermove", event => {
+      if (!dragStart) return;
+      view.offsetX = dragStart.offsetX + event.clientX - dragStart.x;
+      view.offsetY = dragStart.offsetY + event.clientY - dragStart.y;
+      draw();
+    });
+
+    canvas.addEventListener("pointerup", () => {
+      dragStart = null;
+    });
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+  </script>
+</body>
+</html>

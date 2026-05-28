@@ -16,12 +16,16 @@ from sklearn.cluster import HDBSCAN
 from sklearn.decomposition import PCA
 from sklearn.metrics import pairwise_distances_argmin_min
 from sklearn.preprocessing import normalize
+from umap import UMAP
 
 
 DEFAULT_INPUT = Path("data/sample-data.json")
 DEFAULT_CACHE = Path("data/message_body_embeddings_qwen3.npz")
 DEFAULT_OUTPUT = Path("reports/message_body_hierarchy.md")
+DEFAULT_PROJECTION = Path("data/message_body_projection.json")
+DEFAULT_LABEL_CACHE = Path("data/message_body_cluster_labels.json")
 DEFAULT_LABEL_MODEL = "claude-haiku-4.5"
+LABEL_CACHE_VERSION = 1
 POE_BASE_URL = "https://api.poe.com"
 
 REACTION_WORDS = {
@@ -288,6 +292,86 @@ def parse_label_set(data: dict[str, Any]) -> tuple[ClusterLabel, dict[int, Clust
     return parent, subclusters
 
 
+def label_to_json(label: ClusterLabel) -> dict[str, str]:
+    return {
+        "name": label.name,
+        "summary": label.summary,
+        "rationale": label.rationale,
+    }
+
+
+def label_from_json(data: dict[str, Any]) -> ClusterLabel:
+    return ClusterLabel(
+        name=str(data["name"]),
+        summary=str(data["summary"]),
+        rationale=str(data["rationale"]),
+    )
+
+
+def label_payload_hash(payloads: list[dict[str, Any]], model: str) -> str:
+    digest = hashlib.sha256()
+    digest.update(str(LABEL_CACHE_VERSION).encode())
+    digest.update(model.encode())
+    digest.update(
+        json.dumps(payloads, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
+def load_cached_cluster_labels(
+    cache_path: Path,
+    payloads: list[dict[str, Any]],
+    model: str,
+) -> ClusterLabels | None:
+    if not cache_path.exists():
+        return None
+
+    cache = json.loads(cache_path.read_text())
+    metadata = cache.get("metadata", {})
+    if metadata.get("version") != LABEL_CACHE_VERSION:
+        return None
+    if metadata.get("model") != model:
+        return None
+    if metadata.get("payload_hash") != label_payload_hash(payloads, model):
+        return None
+
+    top = {
+        int(cluster_id): label_from_json(label)
+        for cluster_id, label in cache.get("top", {}).items()
+    }
+    subclusters = {
+        tuple(int(part) for part in key.split(".")): label_from_json(label)
+        for key, label in cache.get("subclusters", {}).items()
+    }
+    print(f"loaded cached cluster labels from {cache_path}", flush=True)
+    return ClusterLabels(top=top, subclusters=subclusters)
+
+
+def save_cached_cluster_labels(
+    cache_path: Path,
+    payloads: list[dict[str, Any]],
+    model: str,
+    labels: ClusterLabels,
+) -> None:
+    payload = {
+        "metadata": {
+            "version": LABEL_CACHE_VERSION,
+            "model": model,
+            "payload_hash": label_payload_hash(payloads, model),
+        },
+        "top": {
+            str(cluster_id): label_to_json(label)
+            for cluster_id, label in labels.top.items()
+        },
+        "subclusters": {
+            f"{cluster_id}.{subcluster_id}": label_to_json(label)
+            for (cluster_id, subcluster_id), label in labels.subclusters.items()
+        },
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
 def label_cluster_set(
     client: anthropic.Anthropic,
     model: str,
@@ -376,12 +460,11 @@ def build_cluster_labels(
     min_samples: int,
     max_subclusters: int,
     model: str = DEFAULT_LABEL_MODEL,
+    cache_path: Path | None = DEFAULT_LABEL_CACHE,
 ) -> ClusterLabels:
-    client = anthropic_client()
-    cluster_labels: dict[int, ClusterLabel] = {}
-    subcluster_labels: dict[tuple[int, int], ClusterLabel] = {}
     cluster_ids = [label for label in sorted(set(labels)) if label != -1]
     cluster_ids.sort(key=lambda label: int(np.sum(labels == label)), reverse=True)
+    payloads: list[dict[str, Any]] = []
 
     for cluster_id in cluster_ids:
         member_indices = np.where(labels == cluster_id)[0]
@@ -416,18 +499,39 @@ def build_cluster_labels(
                     }
                 )
 
+        payloads.append(
+            {
+                "cluster_id": int(cluster_id),
+                "parent_messages": parent_bodies,
+                "subclusters": subcluster_payloads,
+            }
+        )
+
+    if cache_path is not None:
+        cached = load_cached_cluster_labels(cache_path, payloads, model)
+        if cached is not None:
+            return cached
+
+    client = anthropic_client()
+    cluster_labels: dict[int, ClusterLabel] = {}
+    subcluster_labels: dict[tuple[int, int], ClusterLabel] = {}
+    for payload in payloads:
         parent_label, child_labels = label_cluster_set(
             client,
             model,
-            parent_bodies,
-            subcluster_payloads,
+            payload["parent_messages"],
+            payload["subclusters"],
         )
-        cluster_labels[int(cluster_id)] = parent_label
+        cluster_id = int(payload["cluster_id"])
+        cluster_labels[cluster_id] = parent_label
         for subcluster_id, label in child_labels.items():
-            subcluster_labels[(int(cluster_id), subcluster_id)] = label
+            subcluster_labels[(cluster_id, subcluster_id)] = label
         print(f"labeled cluster {cluster_id}", flush=True)
 
-    return ClusterLabels(top=cluster_labels, subclusters=subcluster_labels)
+    cluster_label_set = ClusterLabels(top=cluster_labels, subclusters=subcluster_labels)
+    if cache_path is not None:
+        save_cached_cluster_labels(cache_path, payloads, model, cluster_label_set)
+    return cluster_label_set
 
 
 def prominent_users(
@@ -442,6 +546,149 @@ def prominent_users(
         if user:
             counter[user] += 1
     return counter.most_common(limit)
+
+
+def umap_projection(vectors: np.ndarray, random_state: int) -> tuple[np.ndarray, str]:
+    if len(vectors) < 3:
+        coordinates = np.zeros((vectors.shape[0], 2), dtype=np.float32)
+        if vectors.shape[1]:
+            coordinates[:, 0] = vectors[:, 0]
+        return coordinates, "fallback single-axis projection"
+
+    projector = UMAP(
+        n_components=2,
+        n_neighbors=min(15, len(vectors) - 1),
+        min_dist=0.0,
+        metric="cosine",
+        random_state=random_state,
+        n_jobs=1,
+    )
+    coordinates = projector.fit_transform(vectors).astype(np.float32)
+    return coordinates, "UMAP(2) over clustering vectors (n_neighbors=15, min_dist=0, metric=cosine)"
+
+
+def subcluster_assignments(
+    vectors: np.ndarray,
+    top_labels: np.ndarray,
+    min_subcluster_size: int,
+    min_samples: int,
+    max_subclusters: int,
+) -> dict[int, dict[int, int]]:
+    assignments: dict[int, dict[int, int]] = {}
+    cluster_ids = [label for label in sorted(set(top_labels)) if label != -1]
+
+    for cluster_id in cluster_ids:
+        member_indices = np.where(top_labels == cluster_id)[0]
+        if len(member_indices) < min_subcluster_size * 3:
+            continue
+
+        sub_labels = fit_hdbscan(
+            vectors[member_indices],
+            min_cluster_size=min_subcluster_size,
+            min_samples=min_samples,
+        )
+        subcluster_ids = [label for label in sorted(set(sub_labels)) if label != -1]
+        subcluster_ids.sort(key=lambda label: int(np.sum(sub_labels == label)), reverse=True)
+        kept_subclusters = {int(label) for label in subcluster_ids[:max_subclusters]}
+
+        for local_position, sub_label in enumerate(sub_labels):
+            if int(sub_label) in kept_subclusters:
+                global_index = int(member_indices[local_position])
+                assignments[global_index] = {
+                    "parent": int(cluster_id),
+                    "subcluster": int(sub_label),
+                }
+
+    return assignments
+
+
+def cluster_name(
+    cluster_labels: ClusterLabels | dict[int, ClusterLabel] | None,
+    cluster_id: int,
+) -> str | None:
+    if isinstance(cluster_labels, ClusterLabels):
+        label = cluster_labels.top.get(cluster_id)
+    elif cluster_labels:
+        label = cluster_labels.get(cluster_id)
+    else:
+        label = None
+    return label.name if label else None
+
+
+def subcluster_name(
+    cluster_labels: ClusterLabels | dict[int, ClusterLabel] | None,
+    cluster_id: int,
+    subcluster_id: int,
+) -> str | None:
+    if not isinstance(cluster_labels, ClusterLabels):
+        return None
+    label = cluster_labels.subclusters.get((cluster_id, subcluster_id))
+    return label.name if label else None
+
+
+def write_projection_json(
+    output: Path,
+    records: list[BodyRecord],
+    vectors: np.ndarray,
+    top_labels: np.ndarray,
+    min_subcluster_size: int,
+    min_samples: int,
+    max_subclusters: int,
+    random_state: int,
+    clustering_note: str,
+    cluster_labels: ClusterLabels | dict[int, ClusterLabel] | None = None,
+) -> None:
+    coordinates, projection_note = umap_projection(vectors, random_state)
+    subclusters = subcluster_assignments(
+        vectors,
+        top_labels,
+        min_subcluster_size,
+        min_samples,
+        max_subclusters,
+    )
+
+    points: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        cluster_id = int(top_labels[index])
+        subcluster = subclusters.get(index)
+        subcluster_id = subcluster["subcluster"] if subcluster else None
+        points.append(
+            {
+                "index": record.index,
+                "x": float(coordinates[index, 0]),
+                "y": float(coordinates[index, 1]),
+                "cluster": cluster_id,
+                "cluster_name": cluster_name(cluster_labels, cluster_id)
+                if cluster_id != -1
+                else "HDBSCAN Noise / Outliers",
+                "subcluster": subcluster_id,
+                "subcluster_name": subcluster_name(
+                    cluster_labels,
+                    cluster_id,
+                    subcluster_id,
+                )
+                if subcluster_id is not None
+                else None,
+                "user_name": record.user_name,
+                "user_id": record.user_id,
+                "body": record.body,
+            }
+        )
+
+    payload = {
+        "metadata": {
+            "point_count": len(points),
+            "clustering_space": clustering_note,
+            "projection": projection_note,
+            "projection_method": "umap",
+            "x_axis": "UMAP component 1",
+            "y_axis": "UMAP component 2",
+        },
+        "points": points,
+    }
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_report(
