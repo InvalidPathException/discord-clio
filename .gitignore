@@ -2,3 +2,5 @@
 data/
 **/*.pyc
 .env
+.vscode
+reports/message_body_hierarchy.md

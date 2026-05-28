@@ -331,6 +331,7 @@
       if (!payload || !bounds) return;
 
       const visible = filteredPoints();
+      renderLegend(visible);
       for (const point of visible) {
         const screen = project(point);
         const isActive = point === hovered || point === selected;
@@ -403,6 +404,25 @@
       return best;
     }
 
+    function renderLegend(visible) {
+      const clusterRows = [...new Map(visible.map(point => {
+        const name = point.cluster === -1 ? "Noise / Outliers" : point.cluster_name || `Cluster ${point.cluster}`;
+        return [point.cluster, {id: point.cluster, name}];
+      })).values()].sort((a, b) => a.id - b.id);
+
+      const counts = new Map();
+      for (const point of visible) counts.set(point.cluster, (counts.get(point.cluster) || 0) + 1);
+      legend.innerHTML = clusterRows
+        .filter(row => row.id !== -1)
+        .map(row => `
+          <div class="legend-item">
+            <span class="swatch" style="background:${colorFor(row.id)}"></span>
+            <span class="legend-name">${escapeHtml(row.name)}</span>
+            <span>${counts.get(row.id)}</span>
+          </div>
+        `).join("");
+    }
+
     function populateControls() {
       const clusterRows = [...new Map(points.map(point => {
         const name = point.cluster === -1 ? "Noise / Outliers" : point.cluster_name || `Cluster ${point.cluster}`;
@@ -418,18 +438,6 @@
       userFilter.innerHTML = `<option value="all">All users</option>` + users
         .map(user => `<option value="${escapeAttr(user)}">${escapeHtml(user)}</option>`)
         .join("");
-
-      const counts = new Map();
-      for (const point of points) counts.set(point.cluster, (counts.get(point.cluster) || 0) + 1);
-      legend.innerHTML = clusterRows
-        .filter(row => row.id !== -1)
-        .map(row => `
-          <div class="legend-item">
-            <span class="swatch" style="background:${colorFor(row.id)}"></span>
-            <span class="legend-name">${escapeHtml(row.name)}</span>
-            <span>${counts.get(row.id)}</span>
-          </div>
-        `).join("");
     }
 
     function loadProjection(data) {
@@ -469,15 +477,17 @@
       loadProjection(JSON.parse(await file.text()));
     });
 
-    for (const control of [clusterFilter, userFilter, searchInput]) {
-      control.addEventListener("input", () => {
-        hovered = null;
-        selected = null;
-        describe(null);
-        updateTooltip(null);
-        draw();
-      });
+    function clearSelectionAndDraw() {
+      hovered = null;
+      selected = null;
+      describe(null);
+      updateTooltip(null);
+      draw();
     }
+
+    clusterFilter.addEventListener("change", clearSelectionAndDraw);
+    userFilter.addEventListener("change", clearSelectionAndDraw);
+    searchInput.addEventListener("input", clearSelectionAndDraw);
 
     toggleNoise.addEventListener("click", () => {
       showNoise = !showNoise;
